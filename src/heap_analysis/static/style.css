@@ -9,3 +9,6 @@ form { border: 1px solid #ccc; padding: 1em; width: 350px; background: #f9f9f9; 
 label { display: block; margin-bottom: 0.5em; }
 input[type="text"], input[type="file"] { width: 100%; margin-bottom: 1em; }
 input[type="submit"] { padding: 0.5em 1em; }
+dl { margin-bottom: 2em; }
+dt { font-weight: bold; margin-top: 1em; }
+dd { margin-left: 1.5em; margin-bottom: 0.5em; }

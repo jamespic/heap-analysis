@@ -7,7 +7,9 @@ authors = [
     { name = "James Pickering", email = "james.pickering@airelogic.com" },
 ]
 requires-python = ">=3.10"
-dependencies = ["flask>=3.1.3", "lmdb>=2.1.1", "pydantic>=2.12.5"]
+
+[project.optional-dependencies]
+ui = ["flask>=3.1.3", "lmdb>=2.1.1", "pydantic>=2.12.5"]
 
 [project.scripts]
 heap-analysis = "heap_analysis:main"
@@ -17,7 +19,4 @@ requires = ["uv_build>=0.9.22,<0.10.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
-dev = [
-    "ruff>=0.15.7",
-    "ty>=0.0.24",
-]
+dev = ["ruff>=0.15.7", "ty>=0.0.24"]
