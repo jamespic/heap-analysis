@@ -1,7 +1,7 @@
 {% macro object_list(objects, dump_name) %}
 <ul>
     {% for obj in objects %}
-        <li><a href="{{ url_for('explore_object', dump_name=dump_name, obj_id=obj.id) }}">{{ obj.id }} - {{ obj.type }}</a>{% if obj.value is not none %} - {{ obj.value }}{% endif %}</li>
+        <li><a href="{{ url_for('explore_object', dump_name=dump_name, obj_id=obj.id) }}">{{ obj.id }} - {{ obj.type }} - {{ obj.size }} bytes</a>{% if obj.value is not none %} - {{ obj.value }}{% endif %}</li>
     {% endfor %}
 </ul>
 {% endmacro %}

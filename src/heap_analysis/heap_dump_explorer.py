@@ -23,12 +23,14 @@ class ObjectRecord(BaseModel, Generic[T]):
     references: list[T]
     referrers: list[T] = []
     value: str | int | float | None = None
+    size: int
 
 
 class ObjectSummary(BaseModel):
     id: int
     type: str
     value: str | int | float | None = None
+    size: int
     model_config = ConfigDict(extra="ignore")
 
 

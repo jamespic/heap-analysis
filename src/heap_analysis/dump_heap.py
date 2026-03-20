@@ -139,6 +139,7 @@ def _dump_heap():
                     "id": obj_id,
                     "type": type_name,
                     "references": references,
+                    "size": sys.getsizeof(obj, 0),  # Get size of object, excluding referents
                     # Don't get referrers - it's too slow. We'll index it offline later.
                 }
 
