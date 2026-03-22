@@ -53,6 +53,10 @@ def create_app():
     def explore_type(dump_name, type_name):
         explorer = get_dump(dump_name)
         objects: list[ObjectSummary] = explorer.get_objects_by_type(type_name)
+        if request.args.get('sort') == 'size':
+            objects.sort(key=lambda o: o.size, reverse=True)
+        elif request.args.get('sort') == 'subtree_size':
+            objects.sort(key=lambda o: o.subtree_size, reverse=True)
         return render_template(
             "type.html", dump_name=dump_name, type_name=type_name, objects=objects
         )

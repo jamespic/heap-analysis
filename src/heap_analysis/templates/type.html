@@ -7,6 +7,6 @@
 </head>
 <body>
     <h1>Instances of type {{ type_name }} in Heap Dump: {{ dump_name }}</h1>
-    {{ components.object_list(objects, dump_name) }}
+    {{ components.object_list(objects, dump_name, sortable=True) }}
 </body>
 </html>

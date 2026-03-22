@@ -1,7 +1,31 @@
-{% macro object_list(objects, dump_name) %}
-<ul>
+{% macro object_list(objects, dump_name, sortable=False) %}
+<ul><table>
+    <tr>
+        <th>ID</th>
+        <th>Type</th>
+        <th>
+            {% if sortable %}
+                <a href="?sort=size">Size</a>
+            {% else %}
+                Size
+            {% endif %}
+        </th>
+        <th>
+            {% if sortable %}
+                <a href="?sort=subtree_size">Subtree Size</a>
+            {% else %}
+                Subtree Size
+            {% endif %}
+        </th>
+        <th>Value</th></tr>
     {% for obj in objects %}
-        <li><a href="{{ url_for('explore_object', dump_name=dump_name, obj_id=obj.id) }}">{{ obj.id }} - {{ obj.type }} - {{ obj.size }} bytes - {{ obj.subtree_size }} bytes in subtree</a>{% if obj.value is not none %} - {{ obj.value }}{% endif %}</li>
+        <tr>
+            <td><a href="{{ url_for('explore_object', dump_name=dump_name, obj_id=obj.id) }}">{{ obj.id }}</a></td>
+            <td>{{ obj.type }}</td>
+            <td>{{ obj.size }} bytes</td>
+            <td>{{ obj.subtree_size }} bytes</td>
+            <td>{% if obj.value is not none %}{{ obj.value }}{% endif %}</td></tr>
     {% endfor %}
+    </table>
 </ul>
 {% endmacro %}
