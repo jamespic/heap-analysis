@@ -2,12 +2,14 @@
 It uses LMDB to store the data on disk and provides methods for querying objects, their types, and their relationships.
 """
 
+from midden.set_sketch import SetSketch
+
 from .long_stack import run_with_long_stack
 from dataclasses import dataclass
 
 import struct
-from collections import Counter
-from lmdb import Environment, Transaction
+from collections import Counter, deque
+from lmdb import Environment, Transaction, _Database
 from threading import local
 from functools import wraps
 from typing import (
@@ -83,6 +85,7 @@ REFERRERS_DB = b"referrers"
 TYPES_DB = b"types"
 TYPES_SIZE_INDEX_DB = b"types_size_index"
 TYPES_SUBTREE_SIZE_INDEX_DB = b"types_subtree_size_index"
+SCCS_SKETCH_DB = b"sccs_sketch"
 PAGE_SIZE = 1000  # Hardcode this for now
 
 
@@ -130,7 +133,7 @@ def txn() -> Transaction:
 class HeapDumpExplorer:
     def __init__(self, db_path="/tmp/heap_dump_db"):
         self._env = Environment(
-            db_path, map_size=10 * 1024 * 1024 * 1024, max_dbs=5
+            db_path, map_size=10 * 1024 * 1024 * 1024, max_dbs=6
         )  # 10 GB
         self._primary_db = self._env.open_db(PRIMARY_DB, integerkey=True, create=True)
         self._referrers_db = self._env.open_db(
@@ -142,6 +145,9 @@ class HeapDumpExplorer:
         )
         self._types_subtree_size_index_db = self._env.open_db(
             TYPES_SUBTREE_SIZE_INDEX_DB, dupsort=True, create=True
+        )
+        self._sccs_sketch_db = self._env.open_db(
+            SCCS_SKETCH_DB, integerkey=True, create=True
         )
 
     def import_dump(self, dump_path="/tmp/dump.jsonl"):
@@ -170,8 +176,11 @@ class HeapDumpExplorer:
                 type_name.encode(), encoded_obj_id, dupdata=True, db=self._types_db
             )
 
+            self._put_size_index_entry(
+                obj_id, type_name, record.size, self._types_size_index_db
+            )
+
         self._calculate_subtree_sizes()
-        self._build_size_indexes()
 
     @tx
     def get_object(self, obj_id: int) -> ObjectRecord | None:
@@ -285,26 +294,74 @@ class HeapDumpExplorer:
 
         return objects
 
-    def _build_size_indexes(self):
-        # Build indexes for types by size and subtree size
-        t = txn()
-        for obj in self._iterate_all_objects(_RawObjectRecord):
-            size_index_entry = _SizeIndexEntry(size=obj.size, obj_id=obj.id)
-            t.put(
-                obj.type.encode(),
-                size_index_entry._pack(),
-                dupdata=True,
-                db=self._types_size_index_db,
-            )
-            subtree_size_index_entry = _SizeIndexEntry(
-                size=obj.subtree_size, obj_id=obj.id
-            )
-            t.put(
-                obj.type.encode(),
-                subtree_size_index_entry._pack(),
-                dupdata=True,
-                db=self._types_subtree_size_index_db,
-            )
+    @tx
+    def find_path_between_objects(
+        self, start_id: int, end_id: int
+    ) -> list[ObjectSummary] | None:
+        queue = deque([start_id])
+        predecessors = {start_id: None}  # Doubles as a visited set
+        start_sketch = self._get_scc_sketch(start_id)
+        end_sketch = self._get_scc_sketch(end_id)
+        dead_ends = set()
+        if not end_sketch.is_subset_of(start_sketch):
+            return None  # No path can exist if end's reachable SCCs aren't a subset of start's reachable SCCs
+        while queue:
+            current_id = queue.popleft()
+            if current_id == end_id:
+                # Reconstruct path
+                path = []
+                while current_id is not None:
+                    summary = self._load_and_validate(current_id, ObjectSummary)
+                    assert summary is not None
+                    path.append(summary)
+                    current_id = predecessors[current_id]
+                return list(reversed(path))
+
+            if current_id in dead_ends:
+                continue  # Skip known dead ends
+            current_sketch = self._get_scc_sketch(current_id)
+            if not end_sketch.is_subset_of(current_sketch):
+                dead_ends.add(current_id)
+                continue  # No path can exist from current to end, so skip it
+
+            object_record = self._load_and_validate(current_id, _ObjectRecordNoValue)
+            if self._should_skip_link_in_subtree_exploration(object_record):
+                dead_ends.add(current_id)
+                continue
+            assert object_record is not None
+            for ref_id in object_record.references:
+                if ref_id not in predecessors:
+                    predecessors[ref_id] = current_id
+                    queue.append(ref_id)
+
+    def _put_size_index_entry(
+        self, obj_id: int, type_name: str, size: int, db: _Database
+    ):
+        size_index_entry = _SizeIndexEntry(size=size, obj_id=obj_id)
+        txn().put(
+            type_name.encode(),
+            size_index_entry._pack(),
+            dupdata=True,
+            db=db,
+        )
+
+    def _put_sccs_sketch(self, obj_id: int, sccs: SetSketch):
+        txn().put(
+            _pack_id(obj_id),
+            sccs.to_bytes(),
+            db=self._sccs_sketch_db,
+        )
+
+    def _get_scc_sketch(self, obj_id: int) -> SetSketch:
+        data = txn().get(_pack_id(obj_id), db=self._sccs_sketch_db)
+        assert data is not None, f"No sketch found for obj_id {obj_id}"
+        return SetSketch(from_bytes=data)
+
+    def _should_skip_link_in_subtree_exploration(
+        self, link: _ObjectRecordNoValue | None
+    ) -> bool:
+        # Don't include references from modules in the graph, since they create huge SCCs that aren't interesting
+        return link is None or link.type == "builtins.module"
 
     def _calculate_subtree_sizes(self):
         # Calculate subtree sizes using Tarjan
@@ -338,28 +395,34 @@ class HeapDumpExplorer:
             bookkeeping[obj.id] = entry
             stack.append(StackEntry(obj_id=obj.id, size=obj.size))
             index += 1
-            child_sccs: set[int] = set()
+            reachable_sccs: set[int] = set()
+            reachable_sccs_sketch = SetSketch()
 
             for ref_id in obj.references:
                 # Don't include references from modules in the graph, since they create huge SCCs that aren't interesting
                 if ref_id in known_module_ids:
                     continue
                 ref = self._load_and_validate(ref_id, _ObjectRecordNoValue)
-                if ref is None or ref.type == "builtins.module":
+                if self._should_skip_link_in_subtree_exploration(ref):
                     known_module_ids.add(ref_id)
                     continue
                 bookkeeping_entry = bookkeeping.get(ref_id)
                 if bookkeeping_entry is None:
-                    child_sccs.update((yield strongconnect(ref)))
+                    child_sccs = yield strongconnect(ref)
+                    reachable_sccs.update(child_sccs)
+                    reachable_sccs_sketch.add_all(child_sccs)
                     entry.lowlink = min(entry.lowlink, bookkeeping[ref_id].lowlink)
                 elif bookkeeping_entry.on_stack:
                     # Use lowlink variant, so lowlink will point to the root of the SCC, not just the first node we saw
                     entry.lowlink = min(entry.lowlink, bookkeeping_entry.index)
                 else:
-                    child_sccs.add(obj_id_to_scc[ref_id])
+                    reachable_sccs.add(obj_id_to_scc[ref_id])
+                    reachable_sccs_sketch.add(obj_id_to_scc[ref_id])
 
             if entry.index == entry.lowlink:
                 # Found an SCC root, pop the stack and calculate size
+                scc = entry.index
+                reachable_sccs.add(scc)
                 scc_size = 0
                 scc_members = set()
                 while True:
@@ -367,13 +430,13 @@ class HeapDumpExplorer:
                     bookkeeping[member.obj_id].on_stack = False
                     scc_size += member.size
                     scc_members.add(member.obj_id)
-                    obj_id_to_scc[member.obj_id] = entry.index
+                    obj_id_to_scc[member.obj_id] = scc
                     if member.obj_id == obj.id:
                         break
-                scc_sizes[entry.index] = scc_size
+                scc_sizes[scc] = scc_size
 
                 subtree_size = scc_size + sum(
-                    scc_sizes[child_scc] for child_scc in child_sccs
+                    scc_sizes[child_scc] for child_scc in reachable_sccs
                 )
                 for member_id in scc_members:
                     record = self._load_and_validate(member_id, _RawObjectRecord)
@@ -384,9 +447,15 @@ class HeapDumpExplorer:
                         record.model_dump_json().encode(),
                         db=self._primary_db,
                     )
+                    self._put_size_index_entry(
+                        member_id,
+                        record.type,
+                        subtree_size,
+                        self._types_subtree_size_index_db,
+                    )
+                    self._put_sccs_sketch(member_id, reachable_sccs_sketch)
 
-                return child_sccs.union({entry.index})
-            return child_sccs
+            return reachable_sccs
 
         for obj in self._iterate_all_objects(_ObjectRecordNoValue):
             if obj.id not in bookkeeping:

@@ -1,0 +1,13 @@
+{% import 'components.html' as components %}
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Path from {{ from_id }} to {{ to_id }} - {{ dump_name }}</title>
+    <link rel="stylesheet" type="text/css" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <h1>Path from {{ from_id }} to {{ to_id }} in Heap Dump: {{ dump_name }}</h1>
+    <p><a href="{{ url_for('explore_dump', dump_name=dump_name) }}">Back to overview</a></p>
+    {{ components.object_list(path, dump_name) }}
+</body>
+</html>

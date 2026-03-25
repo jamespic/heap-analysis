@@ -90,6 +90,24 @@ def create_app():
         if not obj:
             raise NotFound(f"Object with ID {obj_id} not found in dump '{dump_name}'")
         return render_template("object.html", dump_name=dump_name, obj=obj)
+    
+    @app.route("/explore/<dump_name>/find_path")
+    def find_path(dump_name):
+        explorer = get_dump(dump_name)
+        from_id = request.args.get("from_id", type=int)
+        to_id = request.args.get("to_id", type=int)
+        if from_id is None or to_id is None:
+            return "Missing from_id or to_id query parameters", 400
+        path = explorer.find_path_between_objects(from_id, to_id)
+        if path is None:
+            return f"No path found from object {from_id} to object {to_id}", 404
+        return render_template(
+            "path.html",
+            dump_name=dump_name,
+            from_id=from_id,
+            to_id=to_id,
+            path=path,
+        )
 
     return app
 
