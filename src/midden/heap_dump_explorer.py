@@ -2,9 +2,10 @@
 It uses LMDB to store the data on disk and provides methods for querying objects, their types, and their relationships.
 """
 
+from midden.tarjan import GraphSCCVisitor, visit_sccs
+
 from midden.set_sketch import SetSketch
 
-from .long_stack import run_with_long_stack
 from dataclasses import dataclass
 
 import struct
@@ -17,7 +18,6 @@ from typing import (
     Callable,
     TypeVar,
     Iterable,
-    Generator,
 )
 
 from pydantic import BaseModel, ConfigDict
@@ -136,16 +136,24 @@ class HeapDumpExplorer:
             db_path, map_size=10 * 1024 * 1024 * 1024, max_dbs=6
         )  # 10 GB
         self._primary_db = self._env.open_db(PRIMARY_DB, integerkey=True, create=True)
+        # The referrers_db is a reverse index of the primary_db, mapping
+        # from an object ID to the IDs of objects that reference it, so
+        # we can efficiently look up referrers for any object.
         self._referrers_db = self._env.open_db(
             REFERRERS_DB, integerdup=True, create=True
         )
+        # The types_db maps from type name to the IDs of objects of that type, so we can efficiently look up all objects of a given type.
         self._types_db = self._env.open_db(TYPES_DB, dupsort=True, create=True)
+        # The types_size_index_db and types_subtree_size_index_db are indexes that allow us to look up objects of a given type
+        # ordered by size or subtree size, respectively, for efficient pagination of large types.
         self._types_size_index_db = self._env.open_db(
             TYPES_SIZE_INDEX_DB, dupsort=True, create=True
         )
         self._types_subtree_size_index_db = self._env.open_db(
             TYPES_SUBTREE_SIZE_INDEX_DB, dupsort=True, create=True
         )
+        # The sccs_sketch_db stores a sketch of which SCCs are reachable from each object, to allow for efficient path finding
+        # queries that can quickly rule out objects that can't possibly reach the target.
         self._sccs_sketch_db = self._env.open_db(
             SCCS_SKETCH_DB, integerkey=True, create=True
         )
@@ -180,7 +188,7 @@ class HeapDumpExplorer:
                 obj_id, type_name, record.size, self._types_size_index_db
             )
 
-        self._calculate_subtree_sizes()
+        self._explore_strongly_connected_components()
 
     @tx
     def get_object(self, obj_id: int) -> ObjectRecord | None:
@@ -217,12 +225,6 @@ class HeapDumpExplorer:
         if data is None:
             return None
         return model.model_validate_json(data)
-
-    def _iterate_all_objects(self, model: type[M]) -> Iterable[M]:
-        cursor = txn().cursor(db=self._primary_db)
-        for value in cursor.iternext(keys=False, values=True):
-            assert isinstance(value, bytes)
-            yield model.model_validate_json(value)
 
     @tx
     def get_type_counts(self) -> list[tuple[str, int]]:
@@ -301,9 +303,9 @@ class HeapDumpExplorer:
 
         queue = deque([start_id])
         predecessors = {start_id: None}  # Doubles as a visited set
+        dead_ends = set()
         start_sketch = self._get_scc_sketch(start_id)
         end_sketch = self._get_scc_sketch(end_id)
-        dead_ends = set()
         if not end_sketch.is_subset_of(start_sketch):
             return None  # No path can exist if end's reachable SCCs aren't a subset of start's reachable SCCs
         while queue:
@@ -366,96 +368,97 @@ class HeapDumpExplorer:
         # Don't include references from modules in the graph, since they create huge SCCs that aren't interesting
         return link is None or link.type == "builtins.module"
 
-    def _calculate_subtree_sizes(self):
-        # Calculate subtree sizes using Tarjan
+    def _explore_strongly_connected_components(outer_self):
+        """Run Tarjan's algorithm to find strongly connected components (SCCs) in the object graph.
+
+        This is used to calculate the subtree sizes for each object, as well as to build sketches
+        of which SCCs are reachable from each object for efficient path finding queries."""
         t = txn()
 
         @dataclass(slots=True)
-        class BookkeepingEntry:
-            index: int
-            lowlink: int
-            on_stack: bool
-
-        @dataclass(slots=True)
-        class StackEntry:
-            obj_id: int
+        class WalkResult:
+            subtree_size: int
             size: int
+            scc_sketch: SetSketch
 
-        bookkeeping: dict[int, BookkeepingEntry] = {}
-        stack: list[StackEntry] = []
-        index = 0
-        scc_sizes: dict[int, int] = {}
-        obj_id_to_scc: dict[int, int] = {}
-        known_module_ids: set[int] = set()
+        class ObjectGraphVisitor(
+            GraphSCCVisitor[_ObjectRecordNoValue, int, int, WalkResult]
+        ):
+            def __init__(self):
+                super().__init__()
+                self.known_skips: set[int] = set()
 
-        def strongconnect(
-            obj: _ObjectRecordNoValue,
-        ) -> Generator[
-            set[int], None, set[int]
-        ]:  # Returns set of SCCs that are children of this node
-            nonlocal index
-            entry = BookkeepingEntry(index=index, lowlink=index, on_stack=True)
-            bookkeeping[obj.id] = entry
-            stack.append(StackEntry(obj_id=obj.id, size=obj.size))
-            index += 1
-            reachable_sccs: set[int] = set()
+            def accumulate_node_values(self, v1: int, v2: int) -> int:
+                return v1 + v2
 
-            for ref_id in obj.references:
-                # Don't include references from modules in the graph, since they create huge SCCs that aren't interesting
-                if ref_id in known_module_ids:
-                    continue
-                ref = self._load_and_validate(ref_id, _ObjectRecordNoValue)
-                if self._should_skip_link_in_subtree_exploration(ref):
-                    known_module_ids.add(ref_id)
-                    continue
-                bookkeeping_entry = bookkeeping.get(ref_id)
-                if bookkeeping_entry is None:
-                    child_sccs = yield strongconnect(ref)
-                    reachable_sccs.update(child_sccs)
-                    entry.lowlink = min(entry.lowlink, bookkeeping[ref_id].lowlink)
-                elif bookkeeping_entry.on_stack:
-                    # Use lowlink variant, so lowlink will point to the root of the SCC, not just the first node we saw
-                    entry.lowlink = min(entry.lowlink, bookkeeping_entry.index)
-                else:
-                    reachable_sccs.add(obj_id_to_scc[ref_id])
+            def accumulate(
+                self,
+                node_acc: int,
+                this_scc: int,
+                scc_values: Iterable[tuple[int, WalkResult]],
+            ) -> WalkResult:
+                subtree_size = node_acc + sum(
+                    child_scc.size for _, child_scc in scc_values
+                )
+                scc_sketch = (
+                    SetSketch()
+                    .add_all(child_scc_id for child_scc_id, _ in scc_values)
+                    .add(this_scc)
+                )
+                return WalkResult(
+                    size=node_acc, subtree_size=subtree_size, scc_sketch=scc_sketch
+                )
 
-            if entry.index == entry.lowlink:
-                # Found an SCC root, pop the stack and calculate size
-                scc = entry.index
-                reachable_sccs.add(scc)
-                reachable_sccs_sketch = SetSketch().add_all(reachable_sccs)
-                scc_size = 0
-                scc_members = set()
-                while True:
-                    member = stack.pop()
-                    bookkeeping[member.obj_id].on_stack = False
-                    scc_size += member.size
-                    scc_members.add(member.obj_id)
-                    obj_id_to_scc[member.obj_id] = scc
-                    if member.obj_id == obj.id:
-                        break
-                scc_sizes[scc] = scc_size
+            def iterate_nodes(
+                self, already_visited: Callable[[int], bool]
+            ) -> Iterable[_ObjectRecordNoValue]:
+                with t.cursor(db=outer_self._primary_db) as cursor:
+                    while cursor.next():
+                        obj_id = _unpack_id(cursor.key())
+                        if already_visited(obj_id):
+                            continue
+                        record = _ObjectRecordNoValue.model_validate_json(
+                            cursor.value()
+                        )
+                        yield record
 
-                subtree_size = sum(scc_sizes[child_scc] for child_scc in reachable_sccs)
-                for member_id in scc_members:
-                    record = self._load_and_validate(member_id, _RawObjectRecord)
-                    assert record is not None
-                    record.subtree_size = subtree_size
-                    t.put(
-                        _pack_id(member_id),
-                        record.model_dump_json().encode(),
-                        db=self._primary_db,
-                    )
-                    self._put_size_index_entry(
-                        member_id,
-                        record.type,
-                        subtree_size,
-                        self._types_subtree_size_index_db,
-                    )
-                    self._put_sccs_sketch(member_id, reachable_sccs_sketch)
+            def get_node_id(self, node: _ObjectRecordNoValue) -> int:
+                return node.id
 
-            return reachable_sccs
+            def get_node_acc(self, node: _ObjectRecordNoValue) -> int:
+                return node.size
 
-        for obj in self._iterate_all_objects(_ObjectRecordNoValue):
-            if obj.id not in bookkeeping:
-                run_with_long_stack(strongconnect(obj))
+            def get_successors(
+                self, node: _ObjectRecordNoValue
+            ) -> Iterable[_ObjectRecordNoValue]:
+                for ref_id in node.references:
+                    if ref_id in self.known_skips:
+                        continue
+                    ref_data = t.get(_pack_id(ref_id), db=outer_self._primary_db)
+                    if ref_data is None:
+                        self.known_skips.add(ref_id)
+                        continue
+                    ref_record = _ObjectRecordNoValue.model_validate_json(ref_data)
+                    if outer_self._should_skip_link_in_subtree_exploration(ref_record):
+                        self.known_skips.add(ref_id)
+                        continue
+                    yield ref_record
+
+            def emit_result(self, node_id: int, scc_acc: WalkResult):
+                record = outer_self._load_and_validate(node_id, _RawObjectRecord)
+                assert record is not None
+                record.subtree_size = scc_acc.subtree_size
+                t.put(
+                    _pack_id(node_id),
+                    record.model_dump_json().encode(),
+                    db=outer_self._primary_db,
+                )
+                outer_self._put_size_index_entry(
+                    node_id,
+                    record.type,
+                    scc_acc.subtree_size,
+                    outer_self._types_subtree_size_index_db,
+                )
+                outer_self._put_sccs_sketch(node_id, scc_acc.scc_sketch)
+
+        visit_sccs(ObjectGraphVisitor())
