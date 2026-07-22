@@ -75,3 +75,14 @@ def test_heap_dump_explorer(
         assert explorer.find_largest_common_reachable_object(2, 3) == 4
         assert explorer.find_largest_common_reachable_object(1, 3) == 3
         assert explorer.find_largest_common_reachable_object(2, 5) is None
+
+    if estimator_precision in (EstimatorPrecision.Exact, EstimatorPrecision.High):
+        # id 1 subtree=100; largest strict descendant is id 3 (subtree=70)
+        assert explorer.find_largest_strict_descendant(1) == 3
+        # id 4 has no descendants
+        assert explorer.find_largest_strict_descendant(4) is None
+
+        # largest ancestor of id 4 (subtree=40) is id 1 (subtree=100)
+        assert explorer.find_largest_ancestor(4) == 1
+        # id 1 has no referrers, so it is its own largest ancestor
+        assert explorer.find_largest_ancestor(1) == 1

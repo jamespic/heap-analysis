@@ -138,6 +138,39 @@ def create_app():
             current_to_id=current_to_id,
         )
 
+    @app.route("/explore/<dump_name>/find_largest_strict_descendant")
+    def find_largest_strict_descendant(dump_name):
+        """Find the largest strict descendant of an object in the selected dump."""
+        explorer = get_dump(dump_name)
+        obj_id = request.args.get("obj_id", type=int)
+        if obj_id is None:
+            return "Missing obj_id query parameter", 400
+        largest_descendant_id = explorer.find_largest_strict_descendant(obj_id)
+        if largest_descendant_id is None:
+            raise NotFound(
+                f"No strict descendants found for object ID {obj_id} in dump '{dump_name}'"
+            )
+        return redirect(
+            url_for("explore_object", dump_name=dump_name, obj_id=largest_descendant_id)
+        )
+
+    @app.route("/explore/<dump_name>/find_largest_ancestor")
+    def find_largest_ancestor(dump_name):
+        """Find the largest ancestor of an object in the selected dump."""
+        explorer = get_dump(dump_name)
+        obj_id = request.args.get("obj_id", type=int)
+        if obj_id is None:
+            return "Missing obj_id query parameter", 400
+        largest_ancestor_id = explorer.find_largest_ancestor(obj_id)
+        return redirect(
+            url_for(
+                "find_path",
+                dump_name=dump_name,
+                from_id=largest_ancestor_id,
+                to_id=obj_id,
+            )
+        )
+
     @app.route("/explore/<dump_name>/set_path_finding_endpoint", methods=["POST"])
     def set_path_finding_endpoint(dump_name):
         """Store or complete the pair of object IDs used for path finding."""

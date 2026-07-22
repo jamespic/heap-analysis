@@ -24,6 +24,18 @@
             <button type="submit">Can you find a path from {% if current_from_id %}object {{ current_from_id }}{% else %}...{% endif %} to here?</button>
         </form>
     {% endif %}
+    <p>
+        <a href="{{ url_for('find_largest_strict_descendant', obj_id=obj.id, dump_name=dump_name) }}"
+            title="Find the largest descendant of this object that has a strictly smaller subtree size">
+            Find largest strict descendant
+        </a>
+    </p>
+    <p>
+        <a href="{{ url_for('find_largest_ancestor', obj_id=obj.id, dump_name=dump_name) }}"
+            title="Find the largest ancestor of this object">
+            Find largest ancestor
+        </a>
+    </p>
     <dl>
         <dt>Type:</dt>
         <dd><a href="{{ url_for('explore_type', type_name=obj.type, dump_name=dump_name) }}">{{ obj.type }}</a></dd>

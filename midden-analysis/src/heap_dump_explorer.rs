@@ -46,6 +46,13 @@ struct RawObjectRecord {
     subtree_size: Option<u64>,
 }
 
+impl RawObjectRecord {
+    fn expect_subtree_size(&self) -> anyhow::Result<u64> {
+        self.subtree_size
+            .ok_or_else(|| anyhow::anyhow!("No subtree size in record for object {}", self.id))
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[pyclass(frozen, skip_from_py_object, get_all)]
 /// Full object record including references and referrers.
@@ -721,9 +728,7 @@ impl HeapDumpExplorer {
         ) -> anyhow::Result<QueueItem> {
             Ok(QueueItem {
                 id: record.id,
-                subtree_size: record
-                    .subtree_size
-                    .ok_or_else(|| anyhow::anyhow!("No subtree size in {}", record.id))?,
+                subtree_size: record.expect_subtree_size()?,
                 successors: record.references.clone(),
                 obj_1_or_2,
             })
@@ -772,6 +777,73 @@ impl HeapDumpExplorer {
         }
 
         Ok(None)
+    }
+
+    /// Find the largest descendant of an object that has a smaller subtree.
+    fn find_largest_strict_descendant(&self, obj_id: Id) -> anyhow::Result<Option<Id>> {
+        let rtxn = self.env.read_txn()?;
+        let mut queue: VecDeque<Id> = VecDeque::new();
+        let start_record: RawObjectRecord = self.get_and_decode_record(&rtxn, obj_id)?;
+        let start_subtree_size = start_record.expect_subtree_size()?;
+        let mut largest_id: Option<Id> = None;
+        let mut largest_subtree = 0;
+        let mut visited = HashSet::new();
+        visited.insert(obj_id);
+        for succ_id in start_record.references {
+            queue.push_back(succ_id);
+        }
+        while let Some(next) = queue.pop_front() {
+            let record: RawObjectRecord = self.get_and_decode_record(&rtxn, next)?;
+            if should_skip_link_in_subtree_exploration(&record) || visited.contains(&next) {
+                continue;
+            }
+            visited.insert(next);
+            let next_subtree_size = record.expect_subtree_size()?;
+            if next_subtree_size < start_subtree_size && next_subtree_size > largest_subtree {
+                largest_id = Some(next);
+                largest_subtree = next_subtree_size;
+            } else {
+                for succ_id in record.references {
+                    queue.push_back(succ_id);
+                }
+            }
+        }
+        return Ok(largest_id);
+    }
+
+    /// Find the largest ancestor of an object
+    fn find_largest_ancestor(&self, obj_id: Id) -> anyhow::Result<Id> {
+        let rtxn = self.env.read_txn()?;
+        let mut queue: VecDeque<Id> = VecDeque::new();
+        let mut largest_id: Id = obj_id;
+        let mut largest_subtree = 0;
+        let mut visited = HashSet::new();
+        queue.push_back(obj_id);
+        while let Some(next) = queue.pop_front() {
+            let record: RawObjectRecord = self.get_and_decode_record(&rtxn, next)?;
+            if visited.contains(&next) {
+                continue;
+            }
+            visited.insert(next);
+            let next_subtree_size = record.expect_subtree_size()?;
+            if next_subtree_size > largest_subtree {
+                largest_id = next;
+                largest_subtree = next_subtree_size;
+            }
+            /* For exploring ancestors, we do the skip check _after_ considering the current node.
+            The skip checks assume you're exploring descendants. If we're exploring ancestors,
+            we don't consider ancestors of skipped nodes. */
+            if should_skip_link_in_subtree_exploration(&record) {
+                continue;
+            }
+            if let Some(referrers_iter) = self.referrers_db.get_duplicates(&rtxn, &next)? {
+                for x in referrers_iter {
+                    let (_, referrer_id) = x?;
+                    queue.push_back(referrer_id);
+                }
+            }
+        }
+        Ok(largest_id)
     }
 }
 
