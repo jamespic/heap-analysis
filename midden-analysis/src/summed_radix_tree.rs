@@ -4,7 +4,25 @@ use xxhash_rust::xxh3::Xxh3Default;
 
 const FANOUT: usize = 8;
 
-/// Persistent radix tree used for exact subtree-size unions.
+/// Number of values represented by each leaf and number of children per branch.
+///
+/// A small fanout keeps the tree shallow while making each union inexpensive:
+/// branches can merge their children independently and share unchanged `Rc`s.
+
+/// Persistent radix tree used for exact subtree-size unions and size calculation.
+///
+/// The tree stores a sparse mapping from positions to values. A position's
+/// value is the maximum value contributed by any input tree, so `union` can be
+/// used to combine the exact sets of objects reachable from several roots.
+/// Trees are persistent: updates create only the nodes on the changed paths
+/// and share the rest with their inputs. Each node caches a hash and the
+/// total of all values in its subtree, so equality checks and total queries are
+/// cheap. The tree is sparse: empty children are represented by a shared empty
+/// tree, and leaves are only created for positions that have non-zero values.
+///
+/// Leaves hold up to `FANOUT` adjacent positions. A branch at `level = n`
+/// groups `FANOUT.pow(n)` positions into each child, with child zero covering
+/// the lowest range. Empty children are represented by the shared `Empty` tree.
 #[derive(Debug)]
 pub enum SummedRadixTree {
     Empty,
@@ -14,8 +32,11 @@ pub enum SummedRadixTree {
         total: u64,
     },
     Branch {
+        // `level` is the number of radix digits below this branch. A level-1
+        // branch points to leaves; higher levels point to smaller branches.
         level: u8,
         children: [Rc<SummedRadixTree>; FANOUT],
+        // Cached values make equality checks and aggregate queries cheap.
         hash: u128,
         total: u64,
     },
@@ -64,6 +85,10 @@ impl SummedRadixTree {
     }
 
     /// Return a structural hash used for cheap equality checks during unions.
+    ///
+    /// Hashes are cached because unions commonly compare many subtrees. A hash
+    /// match is only a fast path, not a proof of equality; callers relying on
+    /// collision resistance should treat the result as an optimisation.
     pub fn unique_hash(&self) -> u128 {
         match self {
             Self::Empty => 0,
@@ -73,6 +98,9 @@ impl SummedRadixTree {
     }
 
     /// Return the sum of all values stored in the tree.
+    ///
+    /// This is cached in every non-empty node and is therefore independent of
+    /// the cost of walking the tree.
     pub fn total(&self) -> u64 {
         match self {
             Self::Empty => 0,
@@ -92,6 +120,11 @@ impl SummedRadixTree {
     }
 
     /// Union two trees by taking the elementwise maximum.
+    ///
+    /// When the trees have different heights, the shorter tree belongs in the
+    /// lowest child of the taller one because both represent ranges starting
+    /// at position zero. This is also why positions are encoded from the
+    /// least significant radix digits outward in `_with_single_position_set`.
     pub fn union(self: &Rc<Self>, other: &Rc<Self>) -> Rc<Self> {
         match (self.as_ref(), other.as_ref()) {
             (Self::Empty, _) => other.clone(),
@@ -193,7 +226,7 @@ impl SummedRadixTree {
             total: value,
         };
 
-        // Make parent branch nodes as needed
+        // Make parent branch nodes for the radix digits above this leaf.
         let mut current_level = 1;
         let mut child_index = leaf_index;
         while child_index > 0 {
